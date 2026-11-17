@@ -1,0 +1,899 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenBSD 软件包依赖地图</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --background: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #79c0ff;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--background);
+      color: var(--text);
+      font: 14px/1.5 system-ui, sans-serif;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 12px 16px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+    }
+
+    h1 { margin: 0 14px 0 0; font-size: 16px; }
+
+    button, input, select {
+      padding: 7px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--background);
+      color: inherit;
+      font: inherit;
+    }
+
+    button { cursor: pointer; }
+    button:hover { border-color: var(--accent); }
+    input[type="search"] { width: 220px; }
+    input[type="file"] { max-width: 230px; }
+
+    input[type="file"]::file-selector-button {
+      margin-right: 8px;
+      padding: 4px 8px;
+      border: 0;
+      border-radius: 4px;
+      background: var(--border);
+      color: white;
+      cursor: pointer;
+    }
+
+    label { display: inline-flex; align-items: center; gap: 6px; }
+
+    #graph-area {
+      position: relative;
+      height: calc(100dvh - 65px);
+      min-height: 400px;
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+      cursor: grab;
+    }
+
+    canvas.dragging { cursor: grabbing; }
+
+    #details {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      width: min(310px, calc(100vw - 28px));
+      max-height: calc(100% - 28px);
+      overflow: auto;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: #161b22ed;
+    }
+
+    #details h2 { margin: 0 0 8px; font-size: 16px; overflow-wrap: anywhere; }
+    #details h3 { margin: 12px 0 5px; font-size: 13px; }
+    #details p { margin: 4px 0; color: var(--muted); }
+
+    #details button {
+      margin: 2px;
+      padding: 3px 7px;
+      max-width: 100%;
+      font-size: 12px;
+      text-align: left;
+      overflow-wrap: anywhere;
+    }
+
+    #status {
+      position: absolute;
+      bottom: 12px;
+      left: 14px;
+      padding: 6px 10px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      background: #0d1117dd;
+      color: var(--muted);
+      pointer-events: none;
+    }
+
+    #hint { font-size: 12px; color: var(--muted); }
+    #error { color: #ff7b72; }
+
+    @media (max-width: 880px) {
+      header { padding: 9px; }
+      #graph-area { height: calc(100dvh - 125px); }
+      #details { top: auto; bottom: 45px; width: 260px; max-height: 40%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>软件包依赖地图</h1>
+    <label>JSON <input id="file-input" type="file" accept=".json,application/json"></label>
+    <input id="package-search" type="search" placeholder="搜索软件包…" list="package-names" autocomplete="off">
+    <datalist id="package-names"></datalist>
+
+    <label>
+      required 含义
+      <select id="required-mode">
+        <option value="dependents">谁依赖它（pkg_info -R）</option>
+        <option value="dependencies">它依赖谁</option>
+      </select>
+    </label>
+
+    <select id="view-mode" aria-label="图形显示范围">
+      <option value="all">全部软件包</option>
+      <option value="dependencies">递归依赖</option>
+      <option value="dependents">反向依赖</option>
+      <option value="both">双向关联</option>
+    </select>
+
+    <button id="fit-button">适应画布</button>
+    <button id="example-button">示例数据</button>
+    <span id="hint">滚轮缩放 · 拖动平移 · 点击节点聚焦 · 双击节点固定/解锁</span>
+  </header>
+
+  <main id="graph-area">
+    <canvas id="graph-canvas" aria-label="软件包依赖关系图"></canvas>
+    <aside id="details"></aside>
+    <div id="status">尚未加载数据</div>
+  </main>
+
+  <script>
+    'use strict';
+
+    // 数据格式：[{ name: 'glib2', required: ['gtk4', 'cairo'] }, ...]
+    // 默认遵循 pkg_info -R：required 列出依赖当前包的其他包。
+    // 无论输入采用哪种含义，内部统一为 package.dependencies 和 package.dependents。
+    // 箭头始终从“依赖者”指向“被依赖者”。
+
+    const SAMPLE_DEPENDENCIES = [
+      { name: 'firefox', required: ['gtk4', 'sqlite3', 'nss', 'libevent'] },
+      { name: 'gtk4', required: ['glib2', 'cairo', 'pango', 'gdk-pixbuf'] },
+      { name: 'sqlite3', required: [] },
+      { name: 'nss', required: ['nspr', 'sqlite3'] },
+      { name: 'nspr', required: [] },
+      { name: 'libevent', required: [] },
+      { name: 'glib2', required: [] },
+      { name: 'cairo', required: ['glib2', 'pixman'] },
+      { name: 'pixman', required: [] },
+      { name: 'pango', required: ['glib2', 'cairo'] },
+      { name: 'gdk-pixbuf', required: ['glib2'] },
+      { name: 'mpv', required: ['ffmpeg', 'libass', 'libplacebo'] },
+      { name: 'ffmpeg', required: ['zlib', 'libplacebo'] },
+      { name: 'libass', required: ['freetype', 'harfbuzz'] },
+      { name: 'libplacebo', required: ['glslang'] },
+      { name: 'glslang', required: [] },
+      { name: 'zlib', required: [] },
+      { name: 'freetype', required: ['zlib'] },
+      { name: 'harfbuzz', required: ['freetype', 'glib2'] }
+    ];
+
+    // 将正向依赖的示例转成 pkg_info -R 的数据格式。
+    function reverseSample(packages) {
+      const dependents = new Map(packages.map(({ name }) => [name, []]));
+
+      for (const { name, required } of packages) {
+        for (const dependency of required) {
+          if (!dependents.has(dependency)) dependents.set(dependency, []);
+          dependents.get(dependency).push(name);
+        }
+      }
+
+      return [...dependents].map(([name, required]) => ({ name, required }));
+    }
+
+    const SAMPLE_PACKAGES = reverseSample(SAMPLE_DEPENDENCIES);
+    const getElement = (id) => document.getElementById(id);
+
+    const elements = {
+      canvas: getElement('graph-canvas'),
+      details: getElement('details'),
+      status: getElement('status'),
+      fileInput: getElement('file-input'),
+      search: getElement('package-search'),
+      names: getElement('package-names'),
+      requiredMode: getElement('required-mode'),
+      viewMode: getElement('view-mode'),
+      fitButton: getElement('fit-button'),
+      exampleButton: getElement('example-button')
+    };
+
+    const context = elements.canvas.getContext('2d');
+
+    const state = {
+      sourcePackages: null,
+      packages: [],
+      connections: [],
+      packagesByName: new Map(),
+      visiblePackages: [],
+      visibleConnections: [],
+      selectedName: null,
+      hoveredPackage: null,
+      viewMode: 'all',
+      camera: { x: 0, y: 0, scale: 1 },
+      dragging: null,
+      simulationRunning: false,
+      simulationStartedAt: 0,
+      animationFrame: null,
+      width: 0,
+      height: 0,
+      pixelRatio: 1
+    };
+
+    const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    })[character]);
+
+    // ── 1. 数据解析与依赖关系 ─────────────────────────────────────────────
+
+    function createPackage(name) {
+      return {
+        name,
+        dependencies: new Set(),
+        dependents: new Set(),
+        declared: false,
+        x: 0,
+        y: 0,
+        velocityX: 0,
+        velocityY: 0,
+        fixed: false
+      };
+    }
+
+    function buildGraph(input, requiredMode) {
+      if (!Array.isArray(input)) throw new Error('JSON 顶层必须是数组。');
+
+      const packagesByName = new Map();
+
+      function getOrCreatePackage(name) {
+        if (!packagesByName.has(name)) {
+          packagesByName.set(name, createPackage(name));
+        }
+        return packagesByName.get(name);
+      }
+
+      for (const entry of input) {
+        const valid = entry
+          && typeof entry.name === 'string'
+          && entry.name.trim()
+          && Array.isArray(entry.required)
+          && entry.required.every((name) => typeof name === 'string' && name.trim());
+
+        if (!valid) {
+          throw new Error('每项都必须包含 name 字符串和 required 字符串数组。');
+        }
+
+        const packageName = entry.name.trim();
+        const currentPackage = getOrCreatePackage(packageName);
+
+        if (currentPackage.declared) {
+          throw new Error(`重复的软件包名称：${packageName}`);
+        }
+
+        currentPackage.declared = true;
+
+        for (const rawName of entry.required) {
+          const relatedPackage = getOrCreatePackage(rawName.trim());
+          const dependency = requiredMode === 'dependencies'
+            ? relatedPackage
+            : currentPackage;
+          const dependent = requiredMode === 'dependencies'
+            ? currentPackage
+            : relatedPackage;
+
+          dependent.dependencies.add(dependency.name);
+          dependency.dependents.add(dependent.name);
+        }
+      }
+
+      const packages = [...packagesByName.values()];
+      const connections = packages.flatMap((dependent) =>
+        [...dependent.dependencies].map((name) => ({
+          source: dependent,
+          target: packagesByName.get(name)
+        }))
+      );
+
+      // 向日葵螺旋初始位置，避免所有节点重叠。
+      packages.forEach((pkg, index) => {
+        const angle = index * 2.399963229728653;
+        const radius = 40 * Math.sqrt(index + 1);
+        pkg.x = Math.cos(angle) * radius;
+        pkg.y = Math.sin(angle) * radius;
+      });
+
+      return { packages, connections, packagesByName };
+    }
+
+    function collectRelatedPackages(startName, relation) {
+      const visited = new Set();
+      const pending = [startName];
+
+      while (pending.length > 0) {
+        const name = pending.pop();
+        if (visited.has(name)) continue;
+
+        visited.add(name);
+
+        for (const relatedName of state.packagesByName.get(name)?.[relation] ?? []) {
+          if (!visited.has(relatedName)) pending.push(relatedName);
+        }
+      }
+
+      return visited;
+    }
+
+    function updateVisibleGraph() {
+      let visibleNames;
+      const selectedName = state.selectedName;
+
+      if (!selectedName || state.viewMode === 'all') {
+        visibleNames = new Set(state.packages.map((pkg) => pkg.name));
+      } else if (state.viewMode === 'dependencies') {
+        visibleNames = collectRelatedPackages(selectedName, 'dependencies');
+      } else if (state.viewMode === 'dependents') {
+        visibleNames = collectRelatedPackages(selectedName, 'dependents');
+      } else {
+        visibleNames = new Set([
+          ...collectRelatedPackages(selectedName, 'dependencies'),
+          ...collectRelatedPackages(selectedName, 'dependents')
+        ]);
+      }
+
+      state.visiblePackages = state.packages.filter((pkg) => visibleNames.has(pkg.name));
+      state.visibleConnections = state.connections.filter(({ source, target }) =>
+        visibleNames.has(source.name) && visibleNames.has(target.name)
+      );
+
+      restartSimulation();
+    }
+
+    function loadPackages(input) {
+      // 解析成功之后才覆盖当前数据，避免加载错误时丢失原图。
+      const graph = buildGraph(input, elements.requiredMode.value);
+      state.sourcePackages = input;
+      state.packages = graph.packages;
+      state.connections = graph.connections;
+      state.packagesByName = graph.packagesByName;
+      state.selectedName = null;
+      state.hoveredPackage = null;
+      state.viewMode = 'all';
+      elements.search.value = '';
+      elements.viewMode.value = 'all';
+      elements.names.replaceChildren();
+
+      for (const pkg of state.packages) {
+        const option = document.createElement('option');
+        option.value = pkg.name;
+        elements.names.append(option);
+      }
+
+      updateVisibleGraph();
+      fitGraphToCanvas();
+      renderDetails();
+    }
+
+    // ── 2. 选中节点和详情面板 ─────────────────────────────────────────────
+
+    function selectPackage(name) {
+      const pkg = state.packagesByName.get(name);
+      if (!pkg) return;
+
+      state.selectedName = name;
+      state.hoveredPackage = null;
+      elements.search.value = name;
+      updateVisibleGraph();
+      renderDetails();
+
+      if (state.viewMode === 'all') {
+        centerOnPackage(pkg);
+      } else {
+        fitGraphToCanvas();
+      }
+    }
+
+    function renderPackageButtons(packageNames) {
+      if (!packageNames.length) return '<p>无</p>';
+
+      const sortedNames = packageNames.sort((a, b) => a.localeCompare(b));
+      const buttons = sortedNames.slice(0, 80).map((name) =>
+        `<button data-package="${escapeHtml(name)}">${escapeHtml(name)}</button>`
+      ).join('');
+      const remaining = sortedNames.length - 80;
+
+      return buttons + (remaining > 0 ? `<p>还有 ${remaining} 个……</p>` : '');
+    }
+
+    function renderDetails() {
+      const pkg = state.packagesByName.get(state.selectedName);
+
+      if (!pkg) {
+        elements.details.innerHTML = `
+          <h2>使用方法</h2>
+          <p>选择本地 JSON 文件，或先加载示例。点击节点查看依赖关系。</p>
+          <p>箭头方向始终是：依赖者 → 被依赖者。</p>
+          <p>默认按 pkg_info -R 解释 required，可在顶部切换。</p>
+          <p>搜索软件包后按 Enter 聚焦；双击节点可固定位置。</p>
+        `;
+        return;
+      }
+
+      const recursiveDependencies = collectRelatedPackages(pkg.name, 'dependencies');
+      const recursiveDependents = collectRelatedPackages(pkg.name, 'dependents');
+
+      elements.details.innerHTML = `
+        <h2>${escapeHtml(pkg.name)}</h2>
+        <p>${pkg.declared ? 'JSON 中已定义' : '仅被引用，JSON 中没有其独立条目'}</p>
+        <p>直接依赖 ${pkg.dependencies.size} · 直接被依赖 ${pkg.dependents.size}</p>
+        <p>递归依赖 ${recursiveDependencies.size - 1} · 递归被依赖 ${recursiveDependents.size - 1}</p>
+        <h3>它依赖哪些包</h3>
+        <div>${renderPackageButtons([...pkg.dependencies])}</div>
+        <h3>哪些包依赖它</h3>
+        <div>${renderPackageButtons([...pkg.dependents])}</div>
+        <button id="clear-selection">取消选择</button>
+      `;
+
+      elements.details.querySelectorAll('[data-package]').forEach((button) => {
+        button.addEventListener('click', () => selectPackage(button.dataset.package));
+      });
+
+      getElement('clear-selection').addEventListener('click', () => {
+        state.selectedName = null;
+        updateVisibleGraph();
+        renderDetails();
+      });
+    }
+
+    function showError(message) {
+      let error = getElement('error');
+      if (!error) {
+        error = document.createElement('p');
+        error.id = 'error';
+        elements.details.append(error);
+      }
+      error.textContent = message;
+    }
+
+    // ── 3. 摄像机、缩放与坐标转换 ─────────────────────────────────────────
+
+    function resizeCanvas() {
+      const bounds = elements.canvas.getBoundingClientRect();
+      state.width = bounds.width;
+      state.height = bounds.height;
+      state.pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+      elements.canvas.width = Math.round(state.width * state.pixelRatio);
+      elements.canvas.height = Math.round(state.height * state.pixelRatio);
+      drawGraph();
+    }
+
+    function fitGraphToCanvas() {
+      const packages = state.visiblePackages.length
+        ? state.visiblePackages
+        : state.packages;
+
+      if (packages.length === 0) {
+        state.camera = { x: state.width / 2, y: state.height / 2, scale: 1 };
+        drawGraph();
+        return;
+      }
+
+      const minX = Math.min(...packages.map((pkg) => pkg.x));
+      const maxX = Math.max(...packages.map((pkg) => pkg.x));
+      const minY = Math.min(...packages.map((pkg) => pkg.y));
+      const maxY = Math.max(...packages.map((pkg) => pkg.y));
+      const usableWidth = Math.max(180, state.width - (state.width > 750 ? 370 : 40));
+      const usableHeight = Math.max(150, state.height - 90);
+      const scale = Math.max(0.06, Math.min(
+        1.8,
+        usableWidth / Math.max(maxX - minX + 140, 180),
+        usableHeight / Math.max(maxY - minY + 140, 180)
+      ));
+      const centerX = state.width > 750 ? (state.width - 320) / 2 : state.width / 2;
+
+      state.camera = {
+        x: centerX - (minX + maxX) * scale / 2,
+        y: state.height / 2 - (minY + maxY) * scale / 2,
+        scale
+      };
+      drawGraph();
+    }
+
+    function centerOnPackage(pkg) {
+      const centerX = state.width > 750 ? (state.width - 320) / 2 : state.width / 2;
+      state.camera.x = centerX - pkg.x * state.camera.scale;
+      state.camera.y = state.height / 2 - pkg.y * state.camera.scale;
+      drawGraph();
+    }
+
+    function screenToWorld(clientX, clientY) {
+      const bounds = elements.canvas.getBoundingClientRect();
+      return {
+        x: (clientX - bounds.left - state.camera.x) / state.camera.scale,
+        y: (clientY - bounds.top - state.camera.y) / state.camera.scale
+      };
+    }
+
+    function getNodeRadius(pkg) {
+      return 8 + Math.min(13, Math.sqrt(pkg.dependents.size) * 2.4);
+    }
+
+    function findPackageAt(clientX, clientY) {
+      const point = screenToWorld(clientX, clientY);
+
+      for (let index = state.visiblePackages.length - 1; index >= 0; index--) {
+        const pkg = state.visiblePackages[index];
+        if (Math.hypot(pkg.x - point.x, pkg.y - point.y) < Math.max(15, getNodeRadius(pkg) + 4)) {
+          return pkg;
+        }
+      }
+      return null;
+    }
+
+    // ── 4. Canvas 绘制 ────────────────────────────────────────────────────
+
+    function drawConnection(connection, focusedPackage) {
+      const { source, target } = connection;
+      const deltaX = target.x - source.x;
+      const deltaY = target.y - source.y;
+      const distance = Math.hypot(deltaX, deltaY) || 1;
+      const unitX = deltaX / distance;
+      const unitY = deltaY / distance;
+      const startX = source.x + unitX * (getNodeRadius(source) + 2);
+      const startY = source.y + unitY * (getNodeRadius(source) + 2);
+      const endX = target.x - unitX * (getNodeRadius(target) + 4);
+      const endY = target.y - unitY * (getNodeRadius(target) + 4);
+      const highlighted = focusedPackage
+        && (source === focusedPackage || target === focusedPackage);
+      const scale = state.camera.scale;
+
+      context.strokeStyle = highlighted
+        ? '#79c0ff'
+        : focusedPackage ? '#27303d' : '#425063';
+      context.lineWidth = (highlighted ? 2 : 1) / Math.sqrt(Math.max(0.25, scale));
+      context.beginPath();
+      context.moveTo(startX, startY);
+      context.lineTo(endX, endY);
+      context.stroke();
+
+      const arrowSize = 6 / Math.sqrt(Math.max(0.3, scale));
+      context.fillStyle = context.strokeStyle;
+      context.beginPath();
+      context.moveTo(endX, endY);
+      context.lineTo(endX - unitX * arrowSize - unitY * arrowSize * 0.48,
+                     endY - unitY * arrowSize + unitX * arrowSize * 0.48);
+      context.lineTo(endX - unitX * arrowSize + unitY * arrowSize * 0.48,
+                     endY - unitY * arrowSize - unitX * arrowSize * 0.48);
+      context.closePath();
+      context.fill();
+    }
+
+    function drawPackage(pkg, focusedPackage, nearbyNames) {
+      const isSelected = pkg.name === state.selectedName;
+      const isHovered = pkg === state.hoveredPackage;
+      const isDimmed = focusedPackage && !nearbyNames.has(pkg.name);
+      const radius = getNodeRadius(pkg);
+
+      context.globalAlpha = isDimmed ? 0.25 : 1;
+      context.fillStyle = isSelected ? '#f2cc60'
+        : isHovered ? '#a5d6ff'
+        : !pkg.declared ? '#777f8b'
+        : pkg.dependents.size >= 3 ? '#d2a8ff' : '#79c0ff';
+      context.beginPath();
+      context.arc(pkg.x, pkg.y, radius, 0, Math.PI * 2);
+      context.fill();
+
+      if (pkg.fixed) {
+        context.strokeStyle = '#f2cc60';
+        context.lineWidth = 2;
+        context.stroke();
+      }
+
+      if (state.camera.scale > 0.28 || isSelected || isHovered) {
+        const fontSize = Math.max(10, 12 / Math.sqrt(Math.max(state.camera.scale, 0.4)));
+        context.fillStyle = isSelected ? '#f2cc60' : '#e6edf3';
+        context.font = `${fontSize}px system-ui`;
+        context.textAlign = 'center';
+        context.fillText(pkg.name, pkg.x, pkg.y + radius + 17);
+      }
+
+      context.globalAlpha = 1;
+    }
+
+    function drawGraph() {
+      if (!state.width || !state.height) return;
+
+      context.setTransform(state.pixelRatio, 0, 0, state.pixelRatio, 0, 0);
+      context.fillStyle = '#0d1117';
+      context.fillRect(0, 0, state.width, state.height);
+      context.save();
+      context.translate(state.camera.x, state.camera.y);
+      context.scale(state.camera.scale, state.camera.scale);
+
+      const focusedName = state.hoveredPackage?.name ?? state.selectedName;
+      const focusedPackage = state.packagesByName.get(focusedName);
+      const nearbyNames = focusedPackage
+        ? new Set([focusedName, ...focusedPackage.dependencies, ...focusedPackage.dependents])
+        : new Set();
+
+      for (const connection of state.visibleConnections) {
+        drawConnection(connection, focusedPackage);
+      }
+      for (const pkg of state.visiblePackages) {
+        drawPackage(pkg, focusedPackage, nearbyNames);
+      }
+      context.restore();
+
+      elements.status.textContent = [
+        `节点 ${state.visiblePackages.length}/${state.packages.length}`,
+        `依赖边 ${state.visibleConnections.length}/${state.connections.length}`,
+        `缩放 ${Math.round(state.camera.scale * 100)}%`,
+        '紫色：公共依赖',
+        '灰色：缺失定义'
+      ].join(' · ');
+    }
+
+    // ── 5. 简单力导向布局 ─────────────────────────────────────────────────
+
+    function restartSimulation() {
+      state.simulationRunning = true;
+      state.simulationStartedAt = performance.now();
+      requestSimulationFrame();
+    }
+
+    function requestSimulationFrame() {
+      if (state.animationFrame === null) {
+        state.animationFrame = requestAnimationFrame(runSimulationFrame);
+      }
+    }
+
+    function runSimulationFrame() {
+      state.animationFrame = null;
+      if (!state.simulationRunning) return;
+
+      const packages = state.visiblePackages;
+      const count = packages.length;
+      if (count === 0) {
+        state.simulationRunning = false;
+        drawGraph();
+        return;
+      }
+
+      const strength = Math.max(0.04, Math.min(0.3, 100 / count));
+      const stride = count > 400 ? Math.ceil(count / 400) : 1;
+      let totalSpeed = 0;
+
+      for (let index = 0; index < count; index++) {
+        const first = packages[index];
+        if (first.fixed) continue;
+
+        // 向中心施加微弱引力，防止网络无限向外漂移。
+        first.velocityX -= first.x * 0.00015;
+        first.velocityY -= first.y * 0.00015;
+
+        // 节点之间互斥。超大图时抽样计算，减轻主线程负担。
+        for (let otherIndex = (index + 1) % stride; otherIndex < count; otherIndex += stride) {
+          const second = packages[otherIndex];
+          if (first === second) continue;
+
+          const deltaX = first.x - second.x;
+          const deltaY = first.y - second.y;
+          const distanceSquared = deltaX * deltaX + deltaY * deltaY + 80;
+          const distance = Math.sqrt(distanceSquared);
+          const force = Math.min(2.5, 2200 / distanceSquared) * strength;
+          const forceX = deltaX * force / distance;
+          const forceY = deltaY * force / distance;
+
+          first.velocityX += forceX;
+          first.velocityY += forceY;
+          if (!second.fixed) {
+            second.velocityX -= forceX;
+            second.velocityY -= forceY;
+          }
+        }
+      }
+
+      // 有依赖关系的节点通过弹簧相互吸引。
+      for (const { source, target } of state.visibleConnections) {
+        const deltaX = target.x - source.x;
+        const deltaY = target.y - source.y;
+        const distance = Math.hypot(deltaX, deltaY) || 1;
+        const force = Math.max(-1.2, Math.min(1.2, (distance - 100) * 0.006)) * strength;
+        const forceX = deltaX / distance * force;
+        const forceY = deltaY / distance * force;
+
+        if (!source.fixed) {
+          source.velocityX += forceX;
+          source.velocityY += forceY;
+        }
+        if (!target.fixed) {
+          target.velocityX -= forceX;
+          target.velocityY -= forceY;
+        }
+      }
+
+      for (const pkg of packages) {
+        if (pkg.fixed) {
+          pkg.velocityX = 0;
+          pkg.velocityY = 0;
+          continue;
+        }
+
+        pkg.velocityX = Math.max(-7, Math.min(7, pkg.velocityX * 0.85));
+        pkg.velocityY = Math.max(-7, Math.min(7, pkg.velocityY * 0.85));
+        pkg.x += pkg.velocityX;
+        pkg.y += pkg.velocityY;
+        totalSpeed += Math.abs(pkg.velocityX) + Math.abs(pkg.velocityY);
+      }
+
+      drawGraph();
+      const hasMovement = totalSpeed / count > 0.035;
+      const withinTimeLimit = performance.now() - state.simulationStartedAt < 9000;
+      state.simulationRunning = hasMovement && withinTimeLimit;
+      if (state.simulationRunning) requestSimulationFrame();
+    }
+
+    // ── 6. 用户交互 ───────────────────────────────────────────────────────
+
+    function handlePointerDown(event) {
+      if (event.button !== 0) return;
+      elements.canvas.setPointerCapture(event.pointerId);
+      state.dragging = {
+        pkg: findPackageAt(event.clientX, event.clientY),
+        startX: event.clientX,
+        startY: event.clientY,
+        previousX: event.clientX,
+        previousY: event.clientY,
+        moved: false
+      };
+      elements.canvas.classList.add('dragging');
+    }
+
+    function handlePointerMove(event) {
+      const drag = state.dragging;
+      if (!drag) {
+        const hovered = findPackageAt(event.clientX, event.clientY);
+        if (hovered !== state.hoveredPackage) {
+          state.hoveredPackage = hovered;
+          elements.canvas.style.cursor = hovered ? 'pointer' : 'grab';
+          drawGraph();
+        }
+        return;
+      }
+
+      const deltaX = event.clientX - drag.previousX;
+      const deltaY = event.clientY - drag.previousY;
+      drag.previousX = event.clientX;
+      drag.previousY = event.clientY;
+
+      if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 4) {
+        drag.moved = true;
+      }
+      if (!drag.moved) return;
+
+      if (drag.pkg) {
+        drag.pkg.x += deltaX / state.camera.scale;
+        drag.pkg.y += deltaY / state.camera.scale;
+        drag.pkg.velocityX = 0;
+        drag.pkg.velocityY = 0;
+        restartSimulation();
+      } else {
+        state.camera.x += deltaX;
+        state.camera.y += deltaY;
+        drawGraph();
+      }
+    }
+
+    function handlePointerUp() {
+      const drag = state.dragging;
+      if (drag && !drag.moved && drag.pkg) selectPackage(drag.pkg.name);
+      state.dragging = null;
+      elements.canvas.classList.remove('dragging');
+    }
+
+    function handleWheel(event) {
+      event.preventDefault();
+      const bounds = elements.canvas.getBoundingClientRect();
+      const mouseX = event.clientX - bounds.left;
+      const mouseY = event.clientY - bounds.top;
+      const camera = state.camera;
+      const oldScale = camera.scale;
+      const newScale = Math.min(6, Math.max(0.04, oldScale * Math.exp(-event.deltaY * 0.001)));
+
+      // 让光标下的世界坐标在缩放前后保持不变。
+      camera.x = mouseX - (mouseX - camera.x) * newScale / oldScale;
+      camera.y = mouseY - (mouseY - camera.y) * newScale / oldScale;
+      camera.scale = newScale;
+      drawGraph();
+    }
+
+    function searchPackage() {
+      const query = elements.search.value.trim();
+      if (!query) return;
+
+      const exactMatch = state.packagesByName.get(query);
+      const partialMatch = state.packages.find((pkg) =>
+        pkg.name.toLowerCase().includes(query.toLowerCase())
+      );
+      const match = exactMatch ?? partialMatch;
+
+      if (match) selectPackage(match.name);
+      else showError(`没有找到软件包：${query}`);
+    }
+
+    function installEventHandlers() {
+      window.addEventListener('resize', resizeCanvas);
+      elements.canvas.addEventListener('pointerdown', handlePointerDown);
+      elements.canvas.addEventListener('pointermove', handlePointerMove);
+      elements.canvas.addEventListener('pointerup', handlePointerUp);
+      elements.canvas.addEventListener('pointercancel', handlePointerUp);
+      elements.canvas.addEventListener('dblclick', (event) => {
+        const pkg = findPackageAt(event.clientX, event.clientY);
+        if (pkg) {
+          pkg.fixed = !pkg.fixed;
+          restartSimulation();
+          drawGraph();
+        }
+      });
+      elements.canvas.addEventListener('wheel', handleWheel, { passive: false });
+
+      elements.fileInput.addEventListener('change', async (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+        try {
+          loadPackages(JSON.parse(await file.text()));
+        } catch (error) {
+          showError(error.message);
+        }
+      });
+
+      elements.exampleButton.addEventListener('click', () => loadPackages(SAMPLE_PACKAGES));
+      elements.requiredMode.addEventListener('change', () => {
+        if (state.sourcePackages) loadPackages(state.sourcePackages);
+      });
+      elements.viewMode.addEventListener('change', (event) => {
+        state.viewMode = event.target.value;
+        updateVisibleGraph();
+        fitGraphToCanvas();
+      });
+      elements.fitButton.addEventListener('click', fitGraphToCanvas);
+      elements.search.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') searchPackage();
+      });
+      elements.search.addEventListener('input', (event) => {
+        const exact = state.packagesByName.get(event.target.value.trim());
+        if (exact) selectPackage(exact.name);
+      });
+    }
+
+    installEventHandlers();
+    resizeCanvas();
+    loadPackages(SAMPLE_PACKAGES);
+  </script>
+</body>
+</html>
